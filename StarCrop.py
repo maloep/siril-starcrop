@@ -43,6 +43,15 @@ from sirilpy import (
     SirilConnectionError,
 )
 
+
+import sirilpy as s
+s.ensure_installed("astroalign", "numpy")
+
+import astroalign
+import math
+import numpy as np
+
+
 class Config:
     """
     Global configuration.
@@ -78,10 +87,12 @@ class Config:
     ]
 
     MAX_MAGNITUDE_DELTA = 0.5
+    MAX_MAGNITUDE = 4.8
 
-    MIN_SNR = 5.0
+    MIN_SNR = 8.0
 
-    MAX_FWHM_DELTA = 5.0
+    MAX_FWHMX = 10.0
+    MAX_FWHMY = 10.0
 
     
     # ----------------------------------------------------------------------
@@ -217,29 +228,16 @@ class Sequence:
 @dataclass
 class TrackedStar:
     """
-    Represents the reference star and its current position.
+    Represents a star
     """
 
-    reference_x: float
-    reference_y: float
-
-    current_x: float
-    current_y: float
-
-    magnitude: float
-
-    snr: float
-
+    xpos: float
+    ypos: float
+    mag: float
+    SNR: float
     fwhmx: float
     fwhmy: float
     
-    @property
-    def current_position(self):
-        return (self.current_x, self.current_y)
-
-    @property
-    def reference_position(self):
-        return (self.reference_x, self.reference_y)
 
     @classmethod
     def from_psf_star(cls, star):
@@ -248,33 +246,17 @@ class TrackedStar:
         """
 
         return cls(
-            reference_x=star.xpos,
-            reference_y=star.ypos,
-
-            current_x=star.xpos,
-            current_y=star.ypos,
-
-            magnitude=star.mag,
-
-            snr=star.SNR,
-
+            xpos=star.xpos,
+            ypos=star.ypos,
+            mag=star.mag,
+            SNR=star.SNR,
             fwhmx=star.fwhmx,
             fwhmy=star.fwhmy,
         )
 
-    def update(self, star):
-        """
-        Update the current position after a successful match.
-        """
-
-        self.current_x = star.xpos
-        self.current_y = star.ypos
-        
-        self.last_star = star
-
     def magnitude_difference(self, star):
 
-        return abs(self.magnitude - star.mag)
+        return abs(self.mag - star.mag)
 
     def fwhm_difference(self, star):
 
@@ -284,12 +266,12 @@ class TrackedStar:
         )
 
     
-    def is_valid(self, star):
+    @classmethod
+    def is_valid(cls, star):
         """
         Validate a detected star.
         """
 
-        import math
 
         if not star.phot_is_valid:
             return False, "phot_is_valid == False"
@@ -306,40 +288,43 @@ class TrackedStar:
         if not math.isfinite(star.fwhmy):
             return False, "FWHMy is NaN"
 
-        delta_mag = abs(self.magnitude - star.mag)
-
-        if delta_mag > Config.MAX_MAGNITUDE_DELTA:
-
+        if star.mag > Config.MAX_MAGNITUDE:
             return (
                 False,
-                f"ΔMag={delta_mag:.2f} "
-                f"(>{Config.MAX_MAGNITUDE_DELTA})",
+                f"Mag={star.mag:.2f} "
+                f"(>{Config.MAX_MAGNITUDE})",
             )
-
+        
         if star.SNR < Config.MIN_SNR:
-
             return (
                 False,
                 f"SNR={star.SNR:.2f} "
                 f"(<{Config.MIN_SNR})",
             )
-
-        delta_fwhm = max(
-            abs(self.fwhmx - star.fwhmx),
-            abs(self.fwhmy - star.fwhmy),
-        )
-
-        if delta_fwhm > Config.MAX_FWHM_DELTA:
-
+            
+        if star.fwhmx > Config.MAX_FWHMX:
             return (
                 False,
-                f"ΔFWHM={delta_fwhm:.2f} "
-                f"(>{Config.MAX_FWHM_DELTA})",
+                f"FWHMX={star.fwhmx:.2f} "
+                f"(>{Config.MAX_FWHMX})",
+            )
+            
+        if star.fwhmy > Config.MAX_FWHMY:
+            return (
+                False,
+                f"FWHMY={star.fwhmy:.2f} "
+                f"(>{Config.MAX_FWHMY})",
             )
 
         return True, ""
         
-
+    
+    @classmethod
+    def to_log_string(cls, star):
+        return f"""X = {star.xpos}, Y = {star.ypos}, 
+            Mag = {star.mag}, FWHMX = {star.fwhmx}, 
+            FWHMY = {star.fwhmy}, SNR = {star.SNR}"""
+        
 
 class Tracker:
 
@@ -347,28 +332,26 @@ class Tracker:
         self,
         siril,
         sequence,
-        tracked_star,
-        crop_region,
+        selection,
     ):
 
         self.siril = siril
         self.sequence = sequence
-        self.reference_star = tracked_star
-        self.crop = crop_region
+        self.selection = selection
 
 
-    def track_sequence(self):
+    def track_sequence(self, reference_xy):
         """
         Track the reference star through the whole sequence.
         """
 
-        while self.track_next_frame():
+        while self.track_next_frame(reference_xy):
             pass
 
         Log.header("Tracking finished")
     
     
-    def track_next_frame(self):
+    def track_next_frame(self, reference_xy):
         #
         # Next frame
         #
@@ -393,258 +376,322 @@ class Tracker:
         # Search
         #
 
-        found_star = self.find_star()
+        #found_star = self.find_star()
+        source_pos, target_pos = self.find_star_from_catalog(reference_xy)
 
-        if found_star is None:
-            Log.warning("Reference star not found.")
+        if source_pos is None or target_pos is None:
+            Log.warning("no reference star found for current frame.")
             return True
         else:            
             Log.info(
                 f"Found star: "
-                f"({found_star.xpos:.2f}, "
-                f"{found_star.ypos:.2f})"
+                f"({target_pos[0]:.2f}, "
+                f"{target_pos[1]:.2f})"
             )
 
-            Log.info(
-                f"Mag={found_star.mag:.2f} "
-                f"SNR={found_star.SNR:.2f}"
-            )
-
-        #
-        # Update
-        #
-
-        self.reference_star.update(found_star)
-
-        Log.info(
-            f"Star found at "
-            f"({found_star.xpos:.2f}, "
-            f"{found_star.ypos:.2f})"
-        )
         
-        self.crop_current_frame()        
-        self.sequence.save(next_frame)
+        success = self.crop_current_frame(source_pos, target_pos)        
+        
+        if(success):
+            self.sequence.save(next_frame)
 
         return True
         
-    
-    def search_at(self, x, y, radius, label):
-        """
-        Search for the reference star around a given position.
-        """
-        import math
-
-        left = round(x - radius)
-        top = round(y - radius)
-
-        width = radius * 2
-        height = radius * 2
         
-        #
-        # Siril rejects selections larger than about 300x300.
-        #
+    def find_star_from_catalog(self, reference_xy):
         
-        width = min(width, 300)
-        height = min(height, 300)
+        sBuilder = StarCatalogBuilder(self.siril)
+        
+        matches = sBuilder.build_matches_from_reference(reference_xy)
+        
+        matches_x = []
+        matches_y = []
+        
+        for refpos, matchpos in matches.items():
+            if(matchpos is not None):
+                matches_x.append((refpos[0], refpos[1]))
+                matches_y.append((matchpos[0], matchpos[1]))
+        
+        Log.info(f"matches_x = {matches_x}")
+        Log.info(f"matches_y = {matches_y}")
+        
+        if(len(matches_x) == 0 or len(matches_y) == 0):
+            Log.info("No matches found for current frame")
+            return None, None
+        
+        if(len(matches) == 0):
+            Log.info("No matches found")
+            return None, None
+        
+        transform = astroalign.estimate_transform(
+            'affine',
+            matches_x,
+            matches_y
+        )
+        
+        Log.info(f"{transform}")
+        
+        #return 1st match
+        for source, target in matches.items():
+            return source, target
 
-        #
-        # Keep search window inside the image.
-        #
+        return None, None        
+        
+        
+    def crop_current_frame(self, source_pos, target_pos):
+        """
+        Crop the currently loaded image.
+        """
+        crop = CropRegion.from_selection(
+            self.selection,
+            source_pos
+        )
 
-        if left < 0:
+        command = crop.crop_command(target_pos[0], target_pos[1])
 
-            width += left
-            left = 0
+        Log.info(command)
 
-        if top < 0:
+        try:
+            self.siril.cmd(command)
+        except Exception as e:
+            Log.warning(f"Error while cropping frame: {e.message}")
+            return False
 
-            height += top
-            top = 0
+        Log.info("Image cropped.")
+        return True
+ 
+ 
+class StarCatalogBuilder:
 
-        if left + width > self.sequence.width:
-            width = self.sequence.width - left
+    TILE_SIZE = 100
+    TILE_STEP = 75
 
-        if top + height > self.sequence.height:
-            height = self.sequence.height - top
+    def __init__(self, siril):
 
-        if width <= 0 or height <= 0:
-            Log.info("Search window outside image.")
+        self.siril = siril
 
-            return None
 
-        shape = [left, top, width, height]
+    def build_catalog(self, crop, reference_star=None):
+
+        Log.info("StarCatalogBuilder.build_catalog")
+        
+        stars = []
+
+        width = crop.width
+        height = crop.height
+        y = crop.top
+        
+        if (reference_star is not None):
+            stars.append(reference_star) 
+
+        while y < height +crop.top:
+
+            x = crop.left
+
+            while x < width +crop.left:
+
+                shape = self.make_shape(
+                    x,
+                    y,
+                    width +crop.left,
+                    height +crop.top
+                )
+
+                star = self.find_star(shape)
+
+                if star is not None:
+                    stars.append(star)
+
+                x += self.TILE_STEP
+
+            y += self.TILE_STEP
+
+        stars = self.remove_duplicates(stars)
 
         Log.info("")
-        Log.info(f"Searching {label}")
-        Log.info(f"Radius : {radius}")
-        Log.info(f"Shape  : {shape}")
+        Log.info(f"Catalog contains {len(stars)} stars.")
+
+        return stars
+        
+        
+    def build_matches_from_reference(self, reference_xy):
+        
+        Log.info("StarCatalogBuilder.build_catalog_from_reference")
+        
+        stars = []
+        distance_dict = {}
+        offsets_x = []
+        offsets_y = []
+        matches = {}
+        
+        for refpos in reference_xy:
+            Log.info(f"Calculate distances for star at {refpos[0]}, {refpos[1]}")
+            
+            radius = 300
+            
+            crop = CropRegion(
+                left = round(refpos[0] -radius),
+                top = round(refpos[1] -radius),
+                width = 2 * radius,
+                height = 2 * radius,
+                offset_x = 0,
+                offset_y = 0)
+            
+            stars_for_ref = self.build_catalog(crop) 
+            if(len(stars_for_ref) > 0):
+                distance_dict[refpos[0], refpos[1]] = {}
+                for star in stars_for_ref:
+                    distance = (
+                        refpos[0] - star.xpos,
+                        refpos[1] - star.ypos
+                    )
+                    offsets_x.append(distance[0])
+                    offsets_y.append(distance[1])
+                    
+                    distance_dict[(refpos[0], refpos[1])][(star.xpos, star.ypos)] = distance
+                    Log.info(f"{star.xpos},{star.ypos}:{distance[0]},{distance[1]}")
+        
+        x_min, x_max, y_min, y_max, shift_x, shift_y, best_count = self.calculate_average_shift(
+            offsets_x, offsets_y)
+        
+        for key, innerdict in distance_dict.items():
+            
+            if(best_count == 1):
+                matches[key] = None
+                continue    
+            
+            closest_x = 5000.0
+            closest_y = 5000.0
+            best_match = None
+            for innerkey, distance in innerdict.items():
+                if(not(x_min <= distance[0] <= x_max) or not (y_min <= distance[1] <= y_max)):
+                    continue
+                distance_x = abs(distance[0] - shift_x)
+                distance_y = abs(distance[1] - shift_y)
+                if(distance_x < closest_x and distance_y < closest_y):
+                    closest_x = distance_x
+                    closest_y = distance_y
+                    Log.info(f"innerkey = {innerkey}")
+                    best_match = innerkey
+            matches[key] = best_match
+            
+        Log.info("Matches")
+        for key, value in matches.items():
+            Log.info(f"{key}:{value}")
+        
+        return matches
+        
+        
+    def calculate_average_shift(self, offsets_x, offsets_y):
+        
+        # 1. Arrays intern für die mathematischen Operationen absichern
+        arr_x = np.array(offsets_x)
+        arr_y = np.array(offsets_y)
+
+        # 2. Suchfenster-Größe festlegen
+        max_distance = 20.0 
+
+        best_count = 0
+        best_indices = []
+
+        # 3. Gleitendes Fenster berechnen
+        for i in range(len(arr_x)):
+            center_x = arr_x[i]
+            center_y = arr_y[i]
+            
+            in_box_x = np.abs(arr_x - center_x) <= max_distance / 2
+            in_box_y = np.abs(arr_y - center_y) <= max_distance / 2
+            hits = in_box_x & in_box_y
+            count = np.sum(hits)
+            
+            if count > best_count:
+                best_count = count
+                # Speichert die reinen Integer-Indizes ab
+                best_indices = np.where(hits)[0].tolist()
+
+        # 4. Werte fehlerfrei über native Python-Listenabstraktion extrahieren
+        dense_x = [offsets_x[idx] for idx in best_indices]
+        dense_y = [offsets_y[idx] for idx in best_indices]
+
+        # 5. Extremwerte des Wertebereichs bestimmen
+        x_min, x_max = min(dense_x), max(dense_x)
+        y_min, y_max = min(dense_y), max(dense_y)
+
+        # 6. Verschiebungsmittelwert für Folgeberechnungen ermitteln
+        shift_x = sum(dense_x) / len(dense_x)
+        shift_y = sum(dense_y) / len(dense_y)
+
+        Log.info(f"Häufigster Wertebereich gefunden!")
+        Log.info(f"-> X-Bereich: von {x_min:.4f} bis {x_max:.4f}")
+        Log.info(f"-> Y-Bereich: von {y_min:.4f} bis {y_max:.4f}")
+        Log.info(f"-> Anzahl der Punkte im Cluster: {best_count} von {len(offsets_x)}")
+        Log.info(f"\nBerechneter Verschiebungskern:")
+        Log.info(f"-> Delta X = {shift_x:.4f}")
+        Log.info(f"-> Delta Y = {shift_y:.4f}")
+        
+        return x_min, x_max, y_min, y_max, shift_x, shift_y, best_count
+
+        
+    
+    def make_shape(self, x, y, width, height):
+
+        w = min(self.TILE_SIZE, width - x)
+        h = min(self.TILE_SIZE, height - y)
+
+        return [x, y, w, h]
+        
+        
+    def find_star(self, shape):
+
+        tracked_star = None
 
         try:
             star = self.siril.get_selection_star(shape)
         except Exception as e:
-            Log.warning(f"Search failed: {e}")
+            Log.info(f"No star found in shape {shape}: {e}")
             return None
 
         if star is None:
-            Log.info("No candidate found.")
+            Log.info(f"No star found in shape {shape}")
             return None
 
-        Log.info(
-            f"Candidate: "
-            f"({star.xpos:.2f}, {star.ypos:.2f})"
-        )
-
-        Log.info(
-            f"Mag={star.mag:.2f} "
-            f"SNR={star.SNR:.2f} "
-            f"FWHM={star.fwhmx:.2f}/{star.fwhmy:.2f}"
-        )
-
-        valid, reason = self.reference_star.is_valid(star)
-
+        valid, reason = TrackedStar.is_valid(star) 
         if not valid:
-            Log.info(f"Rejected: {reason}")
+            Log.info(f"No star found in shape {shape}: Reason = {reason}")
             return None
-
-        Log.info("Candidate accepted.")
+            
+        Log.info(f"Star found in shape {shape}: {TrackedStar.to_log_string(star)}")
 
         return star
         
         
-    def search_grid(self, center_x, center_y, label):
-        """
-        Search a 3x3 grid using a fixed 300x300 search window.
-        """
+    def remove_duplicates(self, stars):
 
-        candidates = []
+        unique = []
 
-        radius = 150
+        for star in stars:
 
-        for dx, dy in Config.GRID_OFFSETS:
-            star = self.search_at(
-                center_x + dx,
-                center_y + dy,
-                radius,
-                f"{label}-grid ({dx:+d},{dy:+d})",
-            )
+            duplicate = False
 
-            if star is not None:
-                candidates.append(star)
+            for other in unique:
 
-        return candidates
+                d = math.hypot(
+                    star.xpos - other.xpos,
+                    star.ypos - other.ypos
+                )
 
-    
-    def find_star(self):
-        """
-        Find the reference star.
-        """
+                if d < 8:
 
-        candidates = []
+                    duplicate = True
 
-        #
-        # Local search
-        #
+                    break
 
-        for radius in Config.SEARCH_RADII:
-            star = self.search_at(
-                self.reference_star.current_x,
-                self.reference_star.current_y,
-                radius,
-                "current",
-            )
+            if not duplicate:
 
-            if star is not None:
-                candidates.append(star)
+                unique.append(star)
 
-            star = self.search_at(
-                self.reference_star.reference_x,
-                self.reference_star.reference_y,
-                radius,
-                "reference",
-            )
-
-            if star is not None:
-                candidates.append(star)
-
-        #
-        # Grid search around current position
-        #
-
-        Log.info("")
-        Log.info("Starting grid search around current position.")
-
-        candidates.extend(self.search_grid(
-            self.reference_star.current_x,
-            self.reference_star.current_y,
-            "current",
-        ))
-
-       
-        #
-        # Grid search around reference position
-        #
-
-        Log.info("")
-        Log.info("Starting grid search around reference position.")
-
-        candidates.extend(self.search_grid(
-            self.reference_star.reference_x,
-            self.reference_star.reference_y,
-            "reference",
-        ))
-        
-        if len (candidates) > 0:
-            star = min(candidates, key=self.score)
-        
-        if star is None:
-            Log.warning("Reference star not found")
-            return None
-
-        return star
-        
-    
-    def score(self, star):  
-        import math
-
-        delta_mag = abs(
-            star.mag - self.reference_star.magnitude
-        )
-
-        delta_fwhm = max(
-            abs(star.fwhmx - self.reference_star.fwhmx),
-            abs(star.fwhmy - self.reference_star.fwhmy),
-        )
-
-        distance = math.hypot(
-            star.xpos - self.reference_star.reference_x,
-            star.ypos - self.reference_star.reference_y,
-        )
-        
-        Log.info(
-            f"star={star.xpos:.2f}, {star.ypos:.2f}, "
-            f"Delta_Mag={delta_mag:.2f}, "
-            f"delta_fwhm={delta_fwhm:.2f}, "
-            f"distance={distance:.2f}"
-        )
-
-        return (
-            distance,
-        )
-        
-        
-    def crop_current_frame(self):
-        """
-        Crop the currently loaded image.
-        """
-
-        command = self.crop.crop_command(self.reference_star)
-
-        Log.info(command)
-
-        self.siril.cmd(command)
-
-        Log.info("Image cropped.")
-  
+        return unique
+ 
         
 @dataclass
 class CropRegion:
@@ -662,7 +709,7 @@ class CropRegion:
     offset_y: float
 
     @classmethod
-    def from_selection(cls, selection, star):
+    def from_selection(cls, selection, star_pos):
         """
         Create a CropRegion from the current Siril selection.
         """
@@ -681,25 +728,12 @@ class CropRegion:
             top=top,
             width=width,
             height=height,
-            offset_x=star.xpos - left,
-            offset_y=star.ypos - top,
+            offset_x=star_pos[0] - left,
+            offset_y=star_pos[1] - top,
         )
-
-    def crop_position(self, tracked_star):
-        """
-        Calculate the crop position for the current star position.
-
-        Returns:
-            left, top
-        """
-
-        left = tracked_star.current_x - self.offset_x
-        top = tracked_star.current_y - self.offset_y
-
-        return round(left), round(top)
         
 
-    def crop_rectangle(self, tracked_star):
+    def crop_rectangle(self, x, y):
         """
         Calculate the crop rectangle for the current star position.
 
@@ -707,8 +741,8 @@ class CropRegion:
             (left, top, width, height)
         """
 
-        left = round(tracked_star.current_x - self.offset_x)
-        top = round(tracked_star.current_y - self.offset_y)
+        left = round(x - self.offset_x)
+        top = round(y - self.offset_y)
 
         width = round(self.width)
         height = round(self.height)
@@ -716,12 +750,12 @@ class CropRegion:
         return left, top, width, height
 
 
-    def crop_command(self, tracked_star):
+    def crop_command(self, x, y):
         """
         Create the Siril crop command.
         """
 
-        left, top, width, height = self.crop_rectangle(tracked_star)
+        left, top, width, height = self.crop_rectangle(x, y)
 
         return f"crop {left} {top} {width} {height}"
         
@@ -757,19 +791,16 @@ def main():
     # Reference star
     #
 
-    stars = siril.get_image_stars()
+    reference_stars = siril.get_image_stars()
 
-    if len(stars) != 1:
+    if len(reference_stars) == 0:
         Log.error(
-            f"Exactly one reference star must be selected "
-            f"(found {len(stars)})."
+            f"Please select at least 1 reference star (5-10 stars recommended)"
+            f"(found {len(reference_stars)})."
         )
 
         return
 
-    reference_star = TrackedStar.from_psf_star(
-        stars[0]
-    )
 
     #
     # Crop region
@@ -786,7 +817,7 @@ def main():
 
     crop = CropRegion.from_selection(
         selection,
-        stars[0]
+        (reference_stars[0].xpos, reference_stars[0].ypos) 
     )
 
     #
@@ -798,30 +829,6 @@ def main():
     Log.info(f"Name           : {sequence.name}")
     Log.info(f"Images         : {sequence.frame_count()}")
     Log.info(f"Current frame  : {sequence.current}")
-
-    Log.header("Reference star")
-
-    Log.info(
-        f"Position       : "
-        f"({reference_star.reference_x:.2f}, "
-        f"{reference_star.reference_y:.2f})"
-    )
-
-    Log.info(
-        f"Magnitude      : "
-        f"{reference_star.magnitude:.2f}"
-    )
-
-    Log.info(
-        f"SNR            : "
-        f"{reference_star.snr:.2f}"
-    )
-
-    Log.info(
-        f"FWHM           : "
-        f"{reference_star.fwhmx:.2f} / "
-        f"{reference_star.fwhmy:.2f}"
-    )
 
     Log.header("Crop")
 
@@ -848,8 +855,7 @@ def main():
     tracker = Tracker(
         siril=siril,
         sequence=sequence,
-        tracked_star=reference_star,
-        crop_region=crop,
+        selection=selection,
     )
     
     #
@@ -865,20 +871,27 @@ def main():
     sequence.load(sequence.current)
 
     Log.info(
-        f"Loaded reference frame {sequence.current}"
-    )    
+        f"Loaded reference frame {sequence.current+1}"
+    )
     
-    tracker.crop_current_frame()
+    #reference_catalog = StarCatalogBuilder(siril).build_catalog(crop)
+    reference_xy = np.array(
+        [[s.xpos, s.ypos] for s in reference_stars]
+    )
+    
+    success = tracker.crop_current_frame((reference_stars[0].xpos, reference_stars[0].ypos), 
+        (reference_stars[0].xpos, reference_stars[0].ypos))
 
-    sequence.save(sequence.current)
+    if(success):
+        sequence.save(sequence.current)
 
     Log.info("Reference frame processed.")
 
     Log.header("Tracking")
 
-    success = tracker.track_sequence()
+    success = tracker.track_sequence(reference_xy)
     
     
 if __name__ == "__main__":
 
-    main()
+    main()  
