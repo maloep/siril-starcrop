@@ -42,14 +42,20 @@ from sirilpy import (
     SirilInterface,
     SirilConnectionError,
 )
-
+import math
 
 import sirilpy as s
-s.ensure_installed("astroalign", "numpy")
+import sirilpy.enums as senums
 
+s.ensure_installed("astroalign", "numpy", "scikit-image")
+
+from skimage.transform import warp, SimilarityTransform, AffineTransform
 import astroalign
-import math
 import numpy as np
+import skimage
+
+
+siril = SirilInterface()
 
 
 class Config:
@@ -59,7 +65,26 @@ class Config:
 
     VERSION = "0.1.0-alpha1"
 
-    DEBUG = True
+    CROP = True
+    ALIGN = True
+
+    TRACE = 10
+    DEBUG = 20
+    INFO = 30
+    WARNING = 40
+    ERROR = 50
+    NONE = 100
+
+    current_level = TRACE    
+
+    MAX_MAGNITUDE_DELTA = 0.5
+    MAX_MAGNITUDE = 4.8
+
+    MIN_SNR = 8.0
+
+    MAX_FWHMX = 10.0
+    MAX_FWHMY = 10.0
+
 
     SEARCH_RADII = [
         20,
@@ -86,14 +111,6 @@ class Config:
         ( 150, 150),
     ]
 
-    MAX_MAGNITUDE_DELTA = 0.5
-    MAX_MAGNITUDE = 4.8
-
-    MIN_SNR = 8.0
-
-    MAX_FWHMX = 10.0
-    MAX_FWHMY = 10.0
-
     
     # ----------------------------------------------------------------------
     # Output
@@ -104,24 +121,51 @@ class Config:
 
 class Log:
 
-    @staticmethod
-    def info(text=""):
-        print(text)
+    
 
-    @staticmethod
-    def warning(text):
-        print(f"WARNING: {text}")
+    @classmethod
+    def set_level(cls, level: int):        
+        Config.current_level = level
 
-    @staticmethod
-    def error(text):
-        print(f"ERROR: {text}")
+    @classmethod
+    def _should_log(cls, level: int) -> bool:
+        return level >= Config.current_level
 
-    @staticmethod
-    def header(text):
-        print()
-        print("=" * 60)
-        print(text)
-        print("=" * 60)
+    @classmethod
+    def trace(cls, message: str):
+        if cls._should_log(Config.TRACE):
+            siril.log(f"[TRACE] {message}")
+
+    @classmethod
+    def debug(cls, message: str):
+        if cls._should_log(Config.DEBUG):
+            siril.log(f"[DEBUG] {message}")
+
+    @classmethod
+    def info(cls, message: str):
+        if cls._should_log(Config.INFO):
+            siril.log(f"[INFO] {message}")
+
+    @classmethod
+    def warning(cls, message: str):
+        if cls._should_log(Config.WARNING):
+            siril.log(f"[WARNING] {message}", senums.LogColor.SALMON)
+
+    @classmethod
+    def error(cls, message: str):
+        if cls._should_log(Config.ERROR):
+            siril.log(f"[ERROR] {message}", senums.LogColor.RED)
+
+    @classmethod
+    def success(cls, message: str):        
+        siril.log(f"[SUCCESS] {message}", senums.LogColor.GREEN)
+    
+    @classmethod
+    def header(cls, text):
+        siril.log("\n")
+        siril.log("=" * 60)
+        siril.log(text)
+        siril.log("=" * 60)
         
 
 class Sequence:
@@ -139,8 +183,7 @@ class Sequence:
         return self.seq.ry 
 
 
-    def __init__(self, siril: SirilInterface):
-        self.siril = siril
+    def __init__(self, ):        
         self.seq = siril.get_seq()
 
         if self.seq is None:
@@ -170,7 +213,7 @@ class Sequence:
         for extension in (".fit", ".fits", ".fts"):
 
             try:
-                self.siril.cmd(
+                siril.cmd(
                     f"load {self.name}{frame:05d}{extension}"
                 )
                 self.extension = extension
@@ -191,7 +234,7 @@ class Sequence:
         if self.extension is None:
             self.detect_extension()
 
-        self.siril.cmd(
+        siril.cmd(
             f"load {self.name}{frame_index + 1:05d}{self.extension}"
         )
         
@@ -208,21 +251,23 @@ class Sequence:
     def frame_count(self):
         return self.number
         
+    def get_filename(self, frame_index):
+        return (
+            f"{Config.OUTPUT_PREFIX}"
+            f"{frame_index + 1:05d}"
+            f"{self.extension}"
+        )
+        
     
     def save(self, frame_index):
         """
         Save the currently loaded image.
         """
-
-        filename = (
-            f"{Config.OUTPUT_PREFIX}"
-            f"{frame_index + 1:05d}"
-            f"{self.extension}"
-        )
+        filename = self.get_filename(frame_index)
 
         Log.info(f"Saving {filename}")
 
-        self.siril.cmd(f"save {filename}")
+        siril.cmd(f"save {filename}")
         
 
 @dataclass
@@ -267,11 +312,10 @@ class TrackedStar:
 
     
     @classmethod
-    def is_valid(cls, star):
+    def is_valid(cls, star, strict):
         """
         Validate a detected star.
         """
-
 
         if not star.phot_is_valid:
             return False, "phot_is_valid == False"
@@ -287,6 +331,10 @@ class TrackedStar:
 
         if not math.isfinite(star.fwhmy):
             return False, "FWHMy is NaN"
+
+        if (not strict):
+            Log.debug("is_valid() strict == false. Won't check star parameters.")
+            return True, ""
 
         if star.mag > Config.MAX_MAGNITUDE:
             return (
@@ -326,118 +374,335 @@ class TrackedStar:
             FWHMY = {star.fwhmy}, SNR = {star.SNR}"""
         
 
+
 class Tracker:
 
     def __init__(
         self,
-        siril,
         sequence,
-        selection,
+        selection
     ):
 
-        self.siril = siril
         self.sequence = sequence
         self.selection = selection
+        self.transform_dict = {}
 
 
-    def track_sequence(self, reference_xy):
+    def track_sequence(self, reference_positions, cropped_reference_positions, refcropleft, refcroptop, ref_pixeldata):
         """
         Track the reference star through the whole sequence.
         """
 
-        while self.track_next_frame(reference_xy):
+        #Reference image has no transformation matrix
+        self.transform_dict[1] = None
+
+        while self.track_next_frame(reference_positions, cropped_reference_positions, refcropleft, refcroptop, ref_pixeldata):
             pass
+            
+        if(Config.ALIGN):
+            self.create_complete_siril_seq()
 
         Log.header("Tracking finished")
     
     
-    def track_next_frame(self, reference_xy):
+    def track_next_frame(self, reference_positions, cropped_reference_positions, refcropleft, refcroptop, ref_pixeldata):
         #
         # Next frame
         #
 
         next_frame = self.sequence.current + 1
 
+        if(next_frame == 5):
+            Log.info(f"User defined stop at frame {next_frame}.")
+            return False
+
         if next_frame >= self.sequence.frame_count():
             Log.info("Last frame reached.")
             return False
 
-        Log.header(f"Frame {next_frame}")
+        Log.header(f"Frame {next_frame +1}")
 
         #
         # Load frame
         #
 
         self.sequence.load(next_frame)        
-        Log.info(f"Loaded frame {self.sequence.current}")
-        Log.info("Frame loaded.")
+        Log.info(f"Loaded frame {next_frame +1}")
 
         #
         # Search
         #
 
-        #found_star = self.find_star()
-        source_pos, target_pos = self.find_star_from_catalog(reference_xy)
+        ref_xy, match_xy = self.find_matching_stars_from_catalog(reference_positions)
 
-        if source_pos is None or target_pos is None:
+        if ref_xy is None or match_xy is None:
             Log.warning("no reference star found for current frame.")
             return True
         else:            
-            Log.info(
-                f"Found star: "
-                f"({target_pos[0]:.2f}, "
-                f"{target_pos[1]:.2f})"
+            Log.success(
+                f"Found matching star: "
+                f"({ref_xy[0][0]:.2f}, "
+                f"{ref_xy[0][1]:.2f})"
+                f"({match_xy[0][0]:.2f}, "
+                f"{match_xy[0][1]:.2f})"
             )
+        
+        if(Config.CROP):
+            #use 1st match
+            success, matchcropleft, matchcroptop = self.crop_current_frame(ref_xy[0], match_xy[0])
+            
+            if(success):
+                self.sequence.save(next_frame)
 
-        
-        success = self.crop_current_frame(source_pos, target_pos)        
-        
-        if(success):
-            self.sequence.save(next_frame)
+            cropped_ref_xy = []
+            cropped_match_xy = []
+                
+            for refpos in ref_xy:
+                cropped_refpos = (refpos[0]-refcropleft, refpos[1]-refcroptop)
+                cropped_ref_xy.append(self.translate_calculated_refpos_in_real_refpos(cropped_refpos, cropped_reference_positions))
+
+            for matchpos in match_xy:
+                cropped_match_xy.append((matchpos[0]-matchcropleft, matchpos[1]-matchcroptop))
+                        
+            Log.trace(f"cropped_match_xy = {cropped_match_xy}")
+            
+            Log.debug("recalculate matched stars from cropped image")
+            sBuilder = StarCatalogBuilder(siril) 
+            current_matches = sBuilder.build_matches_from_reference(cropped_match_xy, 50, 100, 100, False)
+            cropped_current_positions = []
+                               
+            for refpos, matchpos in current_matches.items():
+                if(matchpos is None):
+                    #current_positions.append(None)
+                    continue                 
+                cropped_current_positions.append((matchpos[0], matchpos[1]))
+            Log.trace(f"current_positions (recalculated) = {cropped_current_positions}")
+                
+            
+        if(Config.ALIGN and (not Config.CROP or success)):                        
+
+            if(Config.CROP):
+                self.align(cropped_ref_xy, cropped_current_positions, ref_pixeldata, next_frame)
+            else:
+                self.align(ref_xy, match_xy, ref_pixeldata, next_frame)
 
         return True
         
         
-    def find_star_from_catalog(self, reference_xy):
+    def find_matching_stars_from_catalog(self, reference_positions):
         
-        sBuilder = StarCatalogBuilder(self.siril)
+        sBuilder = StarCatalogBuilder(siril)
         
-        matches = sBuilder.build_matches_from_reference(reference_xy)
+        matches = sBuilder.build_matches_from_reference(reference_positions, 300, 100, 75, True)
         
-        matches_x = []
-        matches_y = []
+        ref_xy = []
+        match_xy = []
         
         for refpos, matchpos in matches.items():
             if(matchpos is not None):
-                matches_x.append((refpos[0], refpos[1]))
-                matches_y.append((matchpos[0], matchpos[1]))
+                ref_xy.append((refpos[0], refpos[1]))
+                match_xy.append((matchpos[0], matchpos[1]))
         
-        Log.info(f"matches_x = {matches_x}")
-        Log.info(f"matches_y = {matches_y}")
+        Log.trace(f"ref_xy = {ref_xy}")
+        Log.trace(f"match_xy = {match_xy}")
         
-        if(len(matches_x) == 0 or len(matches_y) == 0):
-            Log.info("No matches found for current frame")
+        if(len(ref_xy) == 0 or len(match_xy) == 0):
+            Log.warning("No matches found for current frame")
             return None, None
-        
-        if(len(matches) == 0):
-            Log.info("No matches found")
-            return None, None
-        
+                
+        return ref_xy, match_xy
+    
+
+    def translate_calculated_refpos_in_real_refpos(self, cropped_refpos, cropped_reference_positions):
+
+        cropped_refpos = np.array(cropped_refpos)
+
+        distances = np.sqrt(np.sum((cropped_reference_positions - cropped_refpos)**2, axis=1))
+
+        closest_index = np.argmin(distances)
+
+        return cropped_reference_positions[closest_index]
+
+              
+    def align(self, cropped_ref_xy, cropped_match_xy, ref_pixeldata, next_frame):
+
+        #transform = AffineTransform()
+        #transform.estimate(cropped_ref_xy, cropped_match_xy)
+
         transform = astroalign.estimate_transform(
             'affine',
-            matches_x,
-            matches_y
+            cropped_ref_xy,
+            cropped_match_xy
         )
-        
-        Log.info(f"{transform}")
-        
-        #return 1st match
-        for source, target in matches.items():
-            return source, target
+        Log.debug(f"estimate_transform {transform}")
 
-        return None, None        
+        cropped_ref_xy = np.asarray(cropped_ref_xy, dtype=np.float64)
+        cropped_match_xy = np.asarray(cropped_match_xy, dtype=np.float64)
+
+        # 1. Calculate transformation + map individual pixel errors
+        try:
+            # Map 'current' stars to where they SHOULD be on the reference frame
+            predicted_xy = transform(cropped_match_xy)
+            
+            # Calculate the exact Euclidean pixel distance error for every star pair
+            pixel_errors = np.linalg.norm(predicted_xy - cropped_ref_xy, axis=1)
+            
+            print("--- INDIVIDUAL PIXEL ERRORS ---")
+            for idx, error in enumerate(pixel_errors):
+                print(f"Star Pair {idx + 1}: Error = {error:.2f} pixels")
+                
+        except Exception as e:
+            print(f"Initial mapping failed: {e}")
+
+
+        # 2. AUTOMATED CHECK: Use RANSAC to isolate bad matches 
+        from skimage.measure import ransac
+        from skimage.transform import AffineTransform
+
+        # RANSAC will test combinations and find the consensus
+        # min_samples=3 is the minimum required points to define an Affine plane
+        # residual_threshold=3.0 means any star misaligned by > 3 pixels is flagged as an outlier
+        model_robust, inliers = ransac(
+            (cropped_match_xy, cropped_ref_xy), 
+            AffineTransform, 
+            min_samples=3, 
+            residual_threshold=3.0, 
+            max_trials=100
+        )
+
+        print("\n--- AUTOMATED QUALITY CHECK ---")
+        print(f"Total stars analyzed: {len(cropped_match_xy)}")
+        print(f"Good matches (Inliers): {np.sum(inliers)}")
+        print(f"Bad matches (Outliers): {np.sum(~inliers)}")
+
+        # Isolate the clean star list programmatically
+        clean_current = cropped_match_xy[inliers]
+        clean_reference = cropped_ref_xy[inliers]
+
+        # Identify exactly which indices failed
+        outlier_indices = np.where(~inliers)[0]
+        if len(outlier_indices) > 0:
+            print(f"⚠️ Action required: Star indices {outlier_indices + 1} failed the quality threshold.")
+
+            
+        for idx in range(len(cropped_ref_xy)):
+            point = cropped_ref_xy[idx]
+            result_point = transform(point)
+
+            Log.debug(f"Quellstern bei: {point}")
+            Log.debug(f"Soll landen bei: {cropped_match_xy[idx]}")
+            Log.debug(f"Landet real bei: {result_point}")  
         
+        if(len(model_robust.params) < 3):
+            Log.warning("Less than 3 matching pair of stars fount for current image.")
+            self.transform_dict[next_frame +1] = None
+        else:
+            self.transform_dict[next_frame +1] = model_robust
         
+            
+        return
+        
+        with siril.image_lock():
+            #fit_obj = siril.get_image()
+            Log.info(f"Image filename = {siril.get_image_filename()}")
+            target_data = siril.get_image_pixeldata()
+            
+            print("Target Shape:", target_data.shape)  # MUSS bei RGB (3, Höhe, Breite) sein, NICHT (Höhe, Breite, 3)
+            print("Target Dtype:", target_data.dtype)  # MUSS float32 sein, NICHT float64
+            print("Target Min/Max:", target_data.min(), target_data.max())  # Sollte exakt zwischen 0.0 und 1.0 liegen
+            
+            print("Ref Shape:", ref_pixeldata.shape)  # MUSS bei RGB (3, Höhe, Breite) sein, NICHT (Höhe, Breite, 3)
+            print("Ref Dtype:", ref_pixeldata.dtype)  # MUSS float32 sein, NICHT float64
+            print("Ref Min/Max:", ref_pixeldata.min(), ref_pixeldata.max())  # Sollte exakt zwischen 0.0 und 1.0 liegen
+            
+            channel_r = target_data[0, :, :]
+            channel_g = target_data[1, :, :]
+            channel_b = target_data[2, :, :]
+            #registered_data, footprint = astroalign.apply_transform(transform, target_data, ref_pixeldata)
+            
+            warped_r = warp(channel_r, transform.inverse, cval=0.0)
+            warped_g = warp(channel_g, transform.inverse, cval=0.0)
+            warped_b = warp(channel_b, transform.inverse, cval=0.0)
+            
+            registered_data = np.stack([warped_r, warped_g, warped_b], axis=0)
+            
+            #registered_data = np.nan_to_num(registered_data, nan=0.0, posinf=0.0, neginf=0.0)
+            registered_data = registered_data.astype(np.float32)
+            registered_data = np.clip(registered_data, 0.0, None)
+            
+            print("Mittelwert des Bildes:", np.mean(registered_data))
+            print("Shape:", registered_data.shape)  # MUSS bei RGB (3, Höhe, Breite) sein, NICHT (Höhe, Breite, 3)
+            print("Dtype:", registered_data.dtype)  # MUSS float32 sein, NICHT float64
+            print("Min/Max:", registered_data.min(), registered_data.max())  # Sollte exakt zwischen 0.0 und 1.0 liegen
+            
+            siril.set_image_pixeldata(registered_data)
+            siril.cmd("save", f"r_cropped_{next_frame:05d}.fit")
+
+
+    def create_complete_siril_seq(self):
+        """
+        Creates a complete .seq file from scratch (compatible with Siril 1.4.x).
+        """        
+
+        seq_filepath = f"{Config.OUTPUT_PREFIX}.seq"
+        start_idx = 1
+        num_images = len(self.transform_dict.keys())
+        fixed_len = 5       #5 for 00001
+        ref_image_idx = 1   #index of reference image
+
+        Log.info(f"Write sequence file: {seq_filepath}")
+        
+        # Berechne den relativen Referenz-Index für den Header (Siril intern oft 0-basiert ab Start)
+        rel_ref_idx = ref_image_idx - start_idx
+        
+        with open(seq_filepath, 'w', encoding='utf-8') as f:
+            # 1. Standard-Kommentare schreiben
+            f.write("#Siril sequence file. Contains list of images, selection, registration data and statistics\n")
+            f.write("#S 'sequence_name' start_index nb_images nb_selected fixed_len reference_image version variable_size fz_flag drizzle\n")
+            
+            # 2. Header-Zeile generieren (nb_selected wird auf num_images gesetzt, Version = 6)
+            f.write(f"S '{Config.OUTPUT_PREFIX}' {start_idx} {num_images} {num_images} {fixed_len} {rel_ref_idx} 6 0 0 0\n")
+            
+            # 3. Kanal-Indikator (L 3 steht für vordefinierte Layer-Eigenschaften, Standardwert)
+            f.write("L 3\n")
+            
+            for img_num in self.transform_dict.keys():
+                # 'I <Bildnummer> 1' deklariert das Bild als aktiv/ausgewählt
+                f.write(f"I {img_num} 1\n")
+
+            # 4. Bilder und Registrierungen schreiben
+            for img_num in self.transform_dict.keys():
+                # Prüfen, ob für dieses Bild ein Astroalign-Ergebnis existiert
+                if img_num in self.transform_dict and self.transform_dict[img_num] is not None:
+                    matrix = self.transform_dict[img_num].params
+                    
+                    # Falls Astroalign eine affine 2x3 Matrix wirft, auf homogene 3x3 erweitern
+                    if matrix.shape == (2, 3):
+                        T = np.vstack([matrix, [0, 0, 1]])
+                    else:
+                        T = matrix
+                    
+                    # Verschiebungswerte extrahieren
+                    dx = T[0, 2]
+                    dy = T[1, 2]
+                    
+                    # Matrix flachklopfen für die Ausgabe
+                    m = T.flatten()
+                    
+                    # R1 Zeile (Kanal 1) mit Dummy-Sternanzahl (100) und FWHM schreiben
+                    r1_line = f"R1 {dx:.4f} {dy:.4f} 0.000000 0 0.000000 100 H " \
+                            f"{m[0]:.6g} {m[1]:.6g} {m[2]:.6g} " \
+                            f"{m[3]:.6g} {m[4]:.6g} {m[5]:.6g} " \
+                            f"{m[6]:.6g} {m[7]:.6g} {m[8]:.6g}\n"
+                    f.write(r1_line)
+                else:
+                    # Referenzbild oder Bilder ohne Transformation (Einheitsmatrix)
+                    # Bei der Referenz selbst ist dx=0.0 und dy=0.0
+                    f.write("R1 0 0 0 0 0 0 H 1 0 0 0 1 0 0 0 1\n")
+
+        Log.success(f"Sequence file successfully written: {seq_filepath}")
+
+
     def crop_current_frame(self, source_pos, target_pos):
         """
         Crop the currently loaded image.
@@ -447,33 +712,25 @@ class Tracker:
             source_pos
         )
 
-        command = crop.crop_command(target_pos[0], target_pos[1])
-
-        Log.info(command)
+        command, left, top = crop.crop_command(target_pos[0], target_pos[1])
 
         try:
-            self.siril.cmd(command)
+            siril.cmd(command)
         except Exception as e:
             Log.warning(f"Error while cropping frame: {e.message}")
-            return False
+            return False, 0.0, 0.0
 
-        Log.info("Image cropped.")
-        return True
+        Log.success(f"Image cropped: {command}")
+        return True, left, top
  
  
 class StarCatalogBuilder:
 
-    TILE_SIZE = 100
-    TILE_STEP = 75
-
     def __init__(self, siril):
+        siril = siril
 
-        self.siril = siril
 
-
-    def build_catalog(self, crop, reference_star=None):
-
-        Log.info("StarCatalogBuilder.build_catalog")
+    def build_catalog(self, crop, tile_size, tile_step, strict, reference_star=None):
         
         stars = []
 
@@ -485,51 +742,44 @@ class StarCatalogBuilder:
             stars.append(reference_star) 
 
         while y < height +crop.top:
-
             x = crop.left
-
             while x < width +crop.left:
 
                 shape = self.make_shape(
                     x,
                     y,
                     width +crop.left,
-                    height +crop.top
+                    height +crop.top,
+                    tile_size
                 )
 
-                star = self.find_star(shape)
+                star = self.find_star(shape, strict)
 
                 if star is not None:
                     stars.append(star)
 
-                x += self.TILE_STEP
+                x += tile_step
 
-            y += self.TILE_STEP
+            y += tile_step
 
         stars = self.remove_duplicates(stars)
 
-        Log.info("")
-        Log.info(f"Catalog contains {len(stars)} stars.")
+        Log.trace(f"Catalog {crop} contains {len(stars)} stars.")
 
         return stars
         
         
-    def build_matches_from_reference(self, reference_xy):
-        
-        Log.info("StarCatalogBuilder.build_catalog_from_reference")
-        
-        stars = []
+    def build_matches_from_reference(self, reference_xy, radius, tile_size, tile_step, strict):
+                
         distance_dict = {}
         offsets_x = []
         offsets_y = []
         matches = {}
         
         for refpos in reference_xy:
-            Log.info(f"Calculate distances for star at {refpos[0]}, {refpos[1]}")
+            Log.trace(f"Calculate distances for star at {refpos[0]}, {refpos[1]}")
             
-            radius = 300
-            
-            crop = CropRegion(
+            search = CropRegion(
                 left = round(refpos[0] -radius),
                 top = round(refpos[1] -radius),
                 width = 2 * radius,
@@ -537,9 +787,9 @@ class StarCatalogBuilder:
                 offset_x = 0,
                 offset_y = 0)
             
-            stars_for_ref = self.build_catalog(crop) 
+            stars_for_ref = self.build_catalog(search, tile_size, tile_step, strict) 
+            distance_dict[refpos[0], refpos[1]] = {}
             if(len(stars_for_ref) > 0):
-                distance_dict[refpos[0], refpos[1]] = {}
                 for star in stars_for_ref:
                     distance = (
                         refpos[0] - star.xpos,
@@ -549,7 +799,7 @@ class StarCatalogBuilder:
                     offsets_y.append(distance[1])
                     
                     distance_dict[(refpos[0], refpos[1])][(star.xpos, star.ypos)] = distance
-                    Log.info(f"{star.xpos},{star.ypos}:{distance[0]},{distance[1]}")
+                    Log.trace(f"{star.xpos},{star.ypos}:{distance[0]},{distance[1]}")
         
         x_min, x_max, y_min, y_max, shift_x, shift_y, best_count = self.calculate_average_shift(
             offsets_x, offsets_y)
@@ -571,7 +821,7 @@ class StarCatalogBuilder:
                 if(distance_x < closest_x and distance_y < closest_y):
                     closest_x = distance_x
                     closest_y = distance_y
-                    Log.info(f"innerkey = {innerkey}")
+                    Log.trace(f"innerkey = {innerkey}")
                     best_match = innerkey
             matches[key] = best_match
             
@@ -621,46 +871,43 @@ class StarCatalogBuilder:
         shift_x = sum(dense_x) / len(dense_x)
         shift_y = sum(dense_y) / len(dense_y)
 
-        Log.info(f"Häufigster Wertebereich gefunden!")
-        Log.info(f"-> X-Bereich: von {x_min:.4f} bis {x_max:.4f}")
-        Log.info(f"-> Y-Bereich: von {y_min:.4f} bis {y_max:.4f}")
-        Log.info(f"-> Anzahl der Punkte im Cluster: {best_count} von {len(offsets_x)}")
-        Log.info(f"\nBerechneter Verschiebungskern:")
-        Log.info(f"-> Delta X = {shift_x:.4f}")
-        Log.info(f"-> Delta Y = {shift_y:.4f}")
+        Log.debug(f"Häufigster Wertebereich gefunden!")
+        Log.debug(f"-> X-Bereich: von {x_min:.4f} bis {x_max:.4f}")
+        Log.debug(f"-> Y-Bereich: von {y_min:.4f} bis {y_max:.4f}")
+        Log.debug(f"-> Anzahl der Punkte im Cluster: {best_count} von {len(offsets_x)}")
+        Log.debug(f"\nBerechneter Verschiebungskern:")
+        Log.debug(f"-> Delta X = {shift_x:.4f}")
+        Log.debug(f"-> Delta Y = {shift_y:.4f}")
         
         return x_min, x_max, y_min, y_max, shift_x, shift_y, best_count
-
         
     
-    def make_shape(self, x, y, width, height):
+    def make_shape(self, x, y, width, height, tile_size):
 
-        w = min(self.TILE_SIZE, width - x)
-        h = min(self.TILE_SIZE, height - y)
+        w = min(tile_size, width - x)
+        h = min(tile_size, height - y)
 
         return [x, y, w, h]
         
         
-    def find_star(self, shape):
-
-        tracked_star = None
+    def find_star(self, shape, strict):
 
         try:
-            star = self.siril.get_selection_star(shape)
+            star = siril.get_selection_star(shape)
         except Exception as e:
-            Log.info(f"No star found in shape {shape}: {e}")
+            Log.trace(f"No star found in shape {shape}: {e}")
             return None
 
         if star is None:
-            Log.info(f"No star found in shape {shape}")
+            Log.trace(f"No star found in shape {shape}")
             return None
 
-        valid, reason = TrackedStar.is_valid(star) 
+        valid, reason = TrackedStar.is_valid(star, strict)
         if not valid:
-            Log.info(f"No star found in shape {shape}: Reason = {reason}")
+            Log.trace(f"No star found in shape {shape}: Reason = {reason}")
             return None
             
-        Log.info(f"Star found in shape {shape}: {TrackedStar.to_log_string(star)}")
+        Log.trace(f"Star found in shape {shape}: {TrackedStar.to_log_string(star)}")
 
         return star
         
@@ -670,24 +917,18 @@ class StarCatalogBuilder:
         unique = []
 
         for star in stars:
-
             duplicate = False
-
             for other in unique:
-
                 d = math.hypot(
                     star.xpos - other.xpos,
                     star.ypos - other.ypos
                 )
 
                 if d < 8:
-
                     duplicate = True
-
                     break
 
             if not duplicate:
-
                 unique.append(star)
 
         return unique
@@ -757,24 +998,23 @@ class CropRegion:
 
         left, top, width, height = self.crop_rectangle(x, y)
 
-        return f"crop {left} {top} {width} {height}"
+        return f"crop {left} {top} {width} {height}", left, top
         
         
 def main():
-
-    Log.header(f"StarCrop {Config.VERSION}")
 
     #
     # Connect to Siril
     #
 
-    try:
-        siril = SirilInterface()
+    try:        
         siril.connect()
+
+        Log.header(f"StarCrop {Config.VERSION}")        
         Log.info("Connected to Siril.")
 
     except SirilConnectionError as ex:
-        Log.error(ex)
+        print(ex)
         return
 
     #
@@ -782,7 +1022,7 @@ def main():
     #
 
     try:
-        sequence = Sequence(siril)
+        sequence = Sequence()
     except RuntimeError as ex:
         Log.error(ex)
         return
@@ -791,7 +1031,11 @@ def main():
     # Reference star
     #
 
-    reference_stars = siril.get_image_stars()
+    try:
+        reference_stars = siril.get_image_stars()
+    except Exception as ex:
+        Log.error("Error detecting selected stars. Please select at least 1 reference star (5-10 stars recommended)")
+        return
 
     if len(reference_stars) == 0:
         Log.error(
@@ -800,25 +1044,32 @@ def main():
         )
 
         return
-
+        
+    reference_positions = np.array(
+        [[s.xpos, s.ypos] for s in reference_stars]
+    )
 
     #
     # Crop region
     #
 
-    selection = siril.get_siril_selection()
+    if(Config.CROP):
+        selection = siril.get_siril_selection()
 
-    if selection is None:
-        Log.error(
-            "No crop region selected."
+        if selection is None:
+            Log.error(
+                "No crop region selected."
+            )
+
+            return
+
+        crop = CropRegion.from_selection(
+            selection,
+            (reference_stars[0].xpos, reference_stars[0].ypos) 
         )
-
-        return
-
-    crop = CropRegion.from_selection(
-        selection,
-        (reference_stars[0].xpos, reference_stars[0].ypos) 
-    )
+    else:
+        [channels, width, height] = siril.get_image_shape()
+        crop = CropRegion(0.0, 0.0, width, height, 0.0, 0.0)
 
     #
     # Information
@@ -843,8 +1094,6 @@ def main():
         f"{crop.offset_y:.2f})"
     )
 
-    Log.info()
-
     Log.info("Initialization finished.")
     
     
@@ -853,9 +1102,8 @@ def main():
     #
 
     tracker = Tracker(
-        siril=siril,
         sequence=sequence,
-        selection=selection,
+        selection=selection
     )
     
     #
@@ -873,23 +1121,47 @@ def main():
     Log.info(
         f"Loaded reference frame {sequence.current+1}"
     )
-    
-    #reference_catalog = StarCatalogBuilder(siril).build_catalog(crop)
-    reference_xy = np.array(
-        [[s.xpos, s.ypos] for s in reference_stars]
-    )
-    
-    success = tracker.crop_current_frame((reference_stars[0].xpos, reference_stars[0].ypos), 
-        (reference_stars[0].xpos, reference_stars[0].ypos))
 
-    if(success):
-        sequence.save(sequence.current)
+    cropped_reference_positions = []
+    cropleft = 0.0
+    croptop = 0.0
+    
+    if(Config.CROP):
+        success, cropleft, croptop = tracker.crop_current_frame((reference_stars[0].xpos, reference_stars[0].ypos), 
+            (reference_stars[0].xpos, reference_stars[0].ypos))
+
+        if(success):
+            sequence.save(sequence.current)
+
+            cropped_ref_positions_tmp = []
+            for refpos in reference_positions:
+                cropped_ref_positions_tmp.append((refpos[0]-cropleft, refpos[1]-croptop))
+
+            Log.trace(f"calculated cropped_ref_positions = {cropped_ref_positions_tmp}")
+
+            Log.debug("rematch reference stars from cropped image")
+            
+            sBuilder = StarCatalogBuilder(siril)        
+            refmatches = sBuilder.build_matches_from_reference(cropped_ref_positions_tmp, 50, 100, 100, False)
+            for refpos, matchpos in refmatches.items():
+                if(matchpos is None):
+                    cropped_reference_positions.append(None)
+                    continue
+                cropped_reference_positions.append((matchpos[0], matchpos[1]))
+            Log.trace(f"reference_positions (rematched) = {cropped_reference_positions}")
+    else:
+        left = selection.x
+        top = selection.y
+        
+    Log.info(f"Image filename = {siril.get_image_filename()}")
+        
+    reference_pixeldata = siril.get_image_pixeldata()
 
     Log.info("Reference frame processed.")
 
     Log.header("Tracking")
 
-    success = tracker.track_sequence(reference_xy)
+    success = tracker.track_sequence(reference_positions, cropped_reference_positions, cropleft, croptop, reference_pixeldata)
     
     
 if __name__ == "__main__":
